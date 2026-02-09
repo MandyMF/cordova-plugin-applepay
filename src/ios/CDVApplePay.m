@@ -1,9 +1,27 @@
 #import "CDVApplePay.h"
+#import <Foundation/Foundation.h>
 @import AddressBook;
 
 @implementation CDVApplePay
 
 @synthesize paymentCallbackId;
+
+#pragma mark - Helpers (safe parsing)
+
+- (NSDecimalNumber *)decimalNumberFromAmountObject:(id)amtObj
+{
+    if (amtObj == nil || (id)amtObj == [NSNull null]) return nil;
+
+    if ([amtObj isKindOfClass:[NSNumber class]]) {
+        return [NSDecimalNumber decimalNumberWithDecimal:[(NSNumber *)amtObj decimalValue]];
+    }
+    if ([amtObj isKindOfClass:[NSString class]]) {
+        NSDecimalNumber *n = [NSDecimalNumber decimalNumberWithString:(NSString *)amtObj];
+        if ([n isEqualToNumber:[NSDecimalNumber notANumber]]) return nil;
+        return n;
+    }
+    return nil;
+}
 
 - (void)canMakePayments:(CDVInvokedUrlCommand*)command
 {
@@ -144,7 +162,10 @@
 
         NSString *label = [item objectForKey:@"label"];
 
-        NSDecimalNumber *amount = [NSDecimalNumber decimalNumberWithDecimal:[[item objectForKey:@"amount"] decimalValue]];
+        NSDecimalNumber *amount = [self decimalNumberFromAmountObject:[item objectForKey:@"amount"]];
+        if (label.length == 0 || amount == nil) {
+            return nil; // invalid payload
+        }
 
         PKPaymentSummaryItem *newItem = [PKPaymentSummaryItem summaryItemWithLabel:label amount:amount];
 
@@ -205,12 +226,14 @@
 
 
     for (NSDictionary *desc in shippingDescriptions) {
-
         NSString *identifier = [desc objectForKey:@"identifier"];
         NSString *detail = [desc objectForKey:@"detail"];
         NSString *label = [desc objectForKey:@"label"];
 
-        NSDecimalNumber *amount = [NSDecimalNumber decimalNumberWithDecimal:[[desc objectForKey:@"amount"] decimalValue]];
+        NSDecimalNumber *amount = [self decimalNumberFromAmountObject:[desc objectForKey:@"amount"]];
+        if (label.length == 0 || amount == nil) {
+            return nil; // invalid payload
+        }
 
         PKPaymentSummaryItem *newMethod = [self shippingMethodWithIdentifier:identifier detail:detail label:label amount:amount];
 
@@ -222,7 +245,6 @@
 
 - (PKPaymentAuthorizationStatus)paymentAuthorizationStatusFromArgument:(NSString *)paymentAuthorizationStatus
 {
-
     if ([paymentAuthorizationStatus isEqualToString:@"success"]) {
         return PKPaymentAuthorizationStatusSuccess;
     } else if ([paymentAuthorizationStatus isEqualToString:@"failure"]) {
@@ -256,9 +278,113 @@
 
         CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString: @"Payment status applied."];
         [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
-
     }
 }
+
+#pragma mark - Recurring Payments (iOS 16+)
+
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
+
+- (NSDate *)dateFromISO8601String:(NSString *)s
+{
+    if (s == nil || (id)s == [NSNull null] || s.length == 0) return nil;
+
+    if (@available(iOS 10.0, *)) {
+        ISO8601DateFormatter *fmt = [ISO8601DateFormatter new];
+        return [fmt dateFromString:s];
+    } else {
+        NSDateFormatter *fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ssXXXXX";
+        return [fmt dateFromString:s];
+    }
+}
+
+- (PKRecurringPaymentSummaryItem *)recurringSummaryItemFromDictionary:(NSDictionary *)dict
+{
+    if (!(dict && (id)dict != [NSNull null])) return nil;
+
+    NSString *label = dict[@"label"];
+    NSDecimalNumber *amount = [self decimalNumberFromAmountObject:dict[@"amount"]];
+    if (label.length == 0 || amount == nil) return nil;
+
+    NSString *intervalUnitStr = dict[@"intervalUnit"];
+    NSCalendarUnit intervalUnit = NSCalendarUnitMonth; // default
+    if ([intervalUnitStr isEqualToString:@"day"]) intervalUnit = NSCalendarUnitDay;
+    else if ([intervalUnitStr isEqualToString:@"week"]) intervalUnit = NSCalendarUnitWeekOfYear;
+    else if ([intervalUnitStr isEqualToString:@"month"]) intervalUnit = NSCalendarUnitMonth;
+    else if ([intervalUnitStr isEqualToString:@"year"]) intervalUnit = NSCalendarUnitYear;
+
+    NSInteger intervalCount = 1;
+    id intervalCountObj = dict[@"intervalCount"];
+    if ([intervalCountObj isKindOfClass:[NSNumber class]]) intervalCount = [intervalCountObj integerValue];
+    else if ([intervalCountObj isKindOfClass:[NSString class]]) intervalCount = [(NSString *)intervalCountObj integerValue];
+    if (intervalCount <= 0) intervalCount = 1;
+
+    NSDate *startDate = [self dateFromISO8601String:dict[@"startDate"]];
+    NSDate *endDate   = [self dateFromISO8601String:dict[@"endDate"]];
+
+    PKRecurringPaymentSummaryItem *item = [PKRecurringPaymentSummaryItem summaryItemWithLabel:label amount:amount];
+    item.intervalUnit = intervalUnit;
+    item.intervalCount = intervalCount;
+
+    if (startDate) item.startDate = startDate;
+    if (endDate)   item.endDate = endDate;
+
+    return item;
+}
+
+- (PKRecurringPaymentRequest *)recurringPaymentRequestFromArguments:(NSArray *)arguments
+{
+    NSDictionary *root = (arguments.count > 0 && arguments[0] != [NSNull null]) ? arguments[0] : nil;
+    NSDictionary *rpr  = root[@"recurringPaymentRequest"];
+    if (!(rpr && (id)rpr != [NSNull null])) return nil;
+
+    if (!@available(iOS 16.0, *)) {
+        return nil;
+    }
+
+    NSString *paymentDescription = rpr[@"paymentDescription"];
+    NSString *managementURLStr   = rpr[@"managementURL"];
+
+    NSDictionary *regularBillingDict = rpr[@"regularBilling"];
+    PKRecurringPaymentSummaryItem *regularBilling = [self recurringSummaryItemFromDictionary:regularBillingDict];
+
+    if (paymentDescription.length == 0 || managementURLStr.length == 0 || regularBilling == nil) {
+        return nil;
+    }
+
+    NSURL *managementURL = [NSURL URLWithString:managementURLStr];
+    if (!managementURL) return nil;
+
+    PKRecurringPaymentRequest *req =
+        [[PKRecurringPaymentRequest alloc] initWithPaymentDescription:paymentDescription
+                                                      regularBilling:regularBilling
+                                                       managementURL:managementURL];
+
+    NSString *billingAgreement = rpr[@"billingAgreement"];
+    if (billingAgreement && (id)billingAgreement != [NSNull null] && billingAgreement.length > 0) {
+        req.billingAgreement = billingAgreement;
+    }
+
+    NSString *tokenNotificationURLStr = rpr[@"tokenNotificationURL"];
+    if (tokenNotificationURLStr && (id)tokenNotificationURLStr != [NSNull null] && tokenNotificationURLStr.length > 0) {
+        NSURL *tokenURL = [NSURL URLWithString:tokenNotificationURLStr];
+        if (tokenURL) req.tokenNotificationURL = tokenURL;
+    }
+
+    NSDictionary *trialBillingDict = rpr[@"trialBilling"];
+    if (trialBillingDict && (id)trialBillingDict != [NSNull null]) {
+        PKRecurringPaymentSummaryItem *trialBilling = [self recurringSummaryItemFromDictionary:trialBillingDict];
+        if (trialBilling) req.trialBilling = trialBilling;
+    }
+
+    return req;
+}
+
+#endif // __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
+
+#pragma mark - Main Payment Request
 
 - (void)makePaymentRequest:(CDVInvokedUrlCommand*)command
 {
@@ -271,12 +397,35 @@
         return;
     }
 
+    NSDictionary *root = (command.arguments.count > 0 && command.arguments[0] != [NSNull null]) ? command.arguments[0] : nil;
+    BOOL hasRecurring = (root[@"recurringPaymentRequest"] && (id)root[@"recurringPaymentRequest"] != [NSNull null]);
+
+    // Runtime guard: recurringPaymentRequest requires iOS 16+
+    if (hasRecurring) {
+        if (!@available(iOS 16.0, *)) {
+            CDVPluginResult* result =
+                [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                  messageAsString:@"recurringPaymentRequest requires iOS 16+."];
+            [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+            return;
+        }
+    }
+
     // reset any lingering callbacks, incase the previous payment failed.
     self.paymentAuthorizationBlock = nil;
 
     PKPaymentRequest *request = [PKPaymentRequest new];
 
-    // All this data is loaded from the Cordova object passed in. See documentation.
+    NSArray *methods = [self shippingMethodsFromArguments:command.arguments];
+    NSArray *items = [self itemsFromArguments:command.arguments];
+
+    if (!methods || !items) {
+        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                   messageAsString:@"Invalid payment payload (amount/label parsing failed)."];
+        [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+        return;
+    }
+
     [request setCurrencyCode:[self currencyCodeFromArguments:command.arguments]];
     [request setCountryCode:[self countryCodeFromArguments:command.arguments]];
     [request setMerchantIdentifier:[self merchantIdentifierFromArguments:command.arguments]];
@@ -287,13 +436,37 @@
     [request setShippingType:[self shippingTypeFromArguments:command.arguments]];
     [request setShippingMethods:[self shippingMethodsFromArguments:command.arguments]];
     [request setPaymentSummaryItems:[self itemsFromArguments:command.arguments]];
-    self.shippingMethods = [self shippingMethodsFromArguments:command.arguments];
-    self.summaryItems = [self itemsFromArguments:command.arguments];
+
+    // Set recurringPaymentRequest (iOS 16+)
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
+    if (hasRecurring) {
+        PKRecurringPaymentRequest *recurringReq = [self recurringPaymentRequestFromArguments:command.arguments];
+        if (!recurringReq) {
+            CDVPluginResult* result =
+                [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                  messageAsString:@"Invalid recurringPaymentRequest payload."];
+            [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+            return;
+        }
+        if (@available(iOS 16.0, *)) {
+            request.recurringPaymentRequest = recurringReq;
+        }
+    }
+#else
+    if (hasRecurring) {
+        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                   messageAsString:@"recurringPaymentRequest requires building with an iOS 16+ SDK."];
+        [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+        return;
+    }
+#endif
+
+    self.shippingMethods = methods;
+    self.summaryItems = items;
 
     NSLog(@"ApplePay request == %@", request);
 
     PKPaymentAuthorizationViewController *authVC = [[PKPaymentAuthorizationViewController alloc] initWithPaymentRequest:request];
-
     authVC.delegate = self;
 
     if (authVC == nil) {
@@ -308,8 +481,19 @@
 - (void)updateItemsAndShippingMethods:(CDVInvokedUrlCommand*)command
 {
     if (self.updateItemsAndShippingMethodsBlock != nil) {
-        self.shippingMethods = [self shippingMethodsFromArguments:command.arguments];
-        self.summaryItems = [self itemsFromArguments:command.arguments];
+        NSArray *methods = [self shippingMethodsFromArguments:command.arguments];
+        NSArray *items = [self itemsFromArguments:command.arguments];
+
+        if (!methods || !items) {
+            CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                       messageAsString:@"Invalid payload (amount/label parsing failed)."];
+            [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+            return;
+        }
+
+        self.shippingMethods = methods;
+        self.summaryItems = items;
+
         self.updateItemsAndShippingMethodsBlock(PKPaymentAuthorizationStatusSuccess, self.shippingMethods, self.summaryItems);
         CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString: @"Updated List Info"];
         [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
