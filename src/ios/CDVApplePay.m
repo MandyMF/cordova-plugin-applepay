@@ -291,14 +291,26 @@
 
     if (@available(iOS 10.0, *)) {
         ISO8601DateFormatter *fmt = [ISO8601DateFormatter new];
-        return [fmt dateFromString:s];
-    } else {
-        NSDateFormatter *fmt = [NSDateFormatter new];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ssXXXXX";
-        return [fmt dateFromString:s];
+        NSDate *d = [fmt dateFromString:s];
+        if (d) return d;
     }
+
+    // Support "yyyy-MM-dd" (like "2026-03-10")
+    NSDateFormatter *ymd = [NSDateFormatter new];
+    ymd.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    ymd.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+    ymd.dateFormat = @"yyyy-MM-dd";
+    NSDate *d2 = [ymd dateFromString:s];
+    if (d2) return d2;
+
+    // Fallback to full ISO-ish
+    NSDateFormatter *full = [NSDateFormatter new];
+    full.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    full.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+    full.dateFormat = @"yyyy-MM-dd'T'HH:mm:ssXXXXX";
+    return [full dateFromString:s];
 }
+
 
 - (PKRecurringPaymentSummaryItem *)recurringSummaryItemFromDictionary:(NSDictionary *)dict
 {
@@ -308,21 +320,53 @@
     NSDecimalNumber *amount = [self decimalNumberFromAmountObject:dict[@"amount"]];
     if (label.length == 0 || amount == nil) return nil;
 
-    NSString *intervalUnitStr = dict[@"intervalUnit"];
-    NSCalendarUnit intervalUnit = NSCalendarUnitMonth; // default
-    if ([intervalUnitStr isEqualToString:@"day"]) intervalUnit = NSCalendarUnitDay;
-    else if ([intervalUnitStr isEqualToString:@"week"]) intervalUnit = NSCalendarUnitWeekOfYear;
-    else if ([intervalUnitStr isEqualToString:@"month"]) intervalUnit = NSCalendarUnitMonth;
-    else if ([intervalUnitStr isEqualToString:@"year"]) intervalUnit = NSCalendarUnitYear;
+    // Accept BOTH: intervalUnit / recurringPaymentIntervalUnit
+    NSString *intervalUnitStr = nil;
+    if ([dict[@"intervalUnit"] isKindOfClass:[NSString class]]) {
+        intervalUnitStr = dict[@"intervalUnit"];
+    }
+    if (intervalUnitStr.length == 0 && [dict[@"recurringPaymentIntervalUnit"] isKindOfClass:[NSString class]]) {
+        intervalUnitStr = dict[@"recurringPaymentIntervalUnit"];
+    }
 
+    NSString *iu = [intervalUnitStr lowercaseString];
+
+    NSCalendarUnit intervalUnit = NSCalendarUnitMonth; // default
+    if ([iu isEqualToString:@"day"]) intervalUnit = NSCalendarUnitDay;
+    else if ([iu isEqualToString:@"week"]) intervalUnit = NSCalendarUnitWeekOfYear;
+    else if ([iu isEqualToString:@"month"]) intervalUnit = NSCalendarUnitMonth;
+    else if ([iu isEqualToString:@"year"]) intervalUnit = NSCalendarUnitYear;
+
+    // intervalCount optional (default 1) — accept BOTH names
     NSInteger intervalCount = 1;
     id intervalCountObj = dict[@"intervalCount"];
-    if ([intervalCountObj isKindOfClass:[NSNumber class]]) intervalCount = [intervalCountObj integerValue];
-    else if ([intervalCountObj isKindOfClass:[NSString class]]) intervalCount = [(NSString *)intervalCountObj integerValue];
+    if (intervalCountObj == nil || intervalCountObj == [NSNull null]) {
+        intervalCountObj = dict[@"recurringPaymentIntervalCount"];
+    }
+    if ([intervalCountObj respondsToSelector:@selector(integerValue)]) {
+        intervalCount = [intervalCountObj integerValue];
+    }
     if (intervalCount <= 0) intervalCount = 1;
 
-    NSDate *startDate = [self dateFromISO8601String:dict[@"startDate"]];
-    NSDate *endDate   = [self dateFromISO8601String:dict[@"endDate"]];
+    // Accept BOTH: startDate / recurringPaymentStartDate
+    NSString *startStr = nil;
+    if ([dict[@"startDate"] isKindOfClass:[NSString class]]) {
+        startStr = dict[@"startDate"];
+    }
+    if (startStr.length == 0 && [dict[@"recurringPaymentStartDate"] isKindOfClass:[NSString class]]) {
+        startStr = dict[@"recurringPaymentStartDate"];
+    }
+
+    NSString *endStr = nil;
+    if ([dict[@"endDate"] isKindOfClass:[NSString class]]) {
+        endStr = dict[@"endDate"];
+    }
+    if (endStr.length == 0 && [dict[@"recurringPaymentEndDate"] isKindOfClass:[NSString class]]) {
+        endStr = dict[@"recurringPaymentEndDate"];
+    }
+
+    NSDate *startDate = [self dateFromISO8601String:startStr];
+    NSDate *endDate   = [self dateFromISO8601String:endStr];
 
     PKRecurringPaymentSummaryItem *item = [PKRecurringPaymentSummaryItem summaryItemWithLabel:label amount:amount];
     item.intervalUnit = intervalUnit;
@@ -390,9 +434,10 @@
 {
     self.paymentCallbackId = command.callbackId;
 
-    NSLog(@"ApplePay canMakePayments == %s", [PKPaymentAuthorizationViewController canMakePayments]? "true" : "false");
-    if ([PKPaymentAuthorizationViewController canMakePayments] == NO) {
-        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString: @"This device cannot make payments."];
+    if (![PKPaymentAuthorizationViewController canMakePayments]) {
+        CDVPluginResult* result =
+            [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                              messageAsString:@"This device cannot make payments."];
         [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
         return;
     }
@@ -400,46 +445,45 @@
     NSDictionary *root = (command.arguments.count > 0 && command.arguments[0] != [NSNull null]) ? command.arguments[0] : nil;
     BOOL hasRecurring = (root[@"recurringPaymentRequest"] && (id)root[@"recurringPaymentRequest"] != [NSNull null]);
 
-    // Runtime guard: recurringPaymentRequest requires iOS 16+
-    if (hasRecurring) {
-        if (!@available(iOS 16.0, *)) {
-            CDVPluginResult* result =
-                [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                  messageAsString:@"recurringPaymentRequest requires iOS 16+."];
-            [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
-            return;
-        }
-    }
-
-    // reset any lingering callbacks, incase the previous payment failed.
-    self.paymentAuthorizationBlock = nil;
-
-    PKPaymentRequest *request = [PKPaymentRequest new];
-
-    NSArray *methods = [self shippingMethodsFromArguments:command.arguments];
-    NSArray *items = [self itemsFromArguments:command.arguments];
-
-    if (!methods || !items) {
-        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                                   messageAsString:@"Invalid payment payload (amount/label parsing failed)."];
+    if (hasRecurring && !@available(iOS 16.0, *)) {
+        CDVPluginResult* result =
+            [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                              messageAsString:@"recurringPaymentRequest requires iOS 16+."];
         [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
         return;
     }
 
-    [request setCurrencyCode:[self currencyCodeFromArguments:command.arguments]];
-    [request setCountryCode:[self countryCodeFromArguments:command.arguments]];
-    [request setMerchantIdentifier:[self merchantIdentifierFromArguments:command.arguments]];
-    [request setMerchantCapabilities:[self merchantCapabilitiesFromArguments:command.arguments]];
-    [request setSupportedNetworks:[self supportedNetworksFromArguments:command.arguments]];
-    [request setRequiredBillingAddressFields:[self billingAddressRequirementFromArguments:command.arguments]];
-    [request setRequiredShippingAddressFields:[self shippingAddressRequirementFromArguments:command.arguments]];
-    [request setShippingType:[self shippingTypeFromArguments:command.arguments]];
-    [request setShippingMethods:[self shippingMethodsFromArguments:command.arguments]];
-    [request setPaymentSummaryItems:[self itemsFromArguments:command.arguments]];
+    self.paymentAuthorizationBlock = nil;
 
-    // Set recurringPaymentRequest (iOS 16+)
+    PKPaymentRequest *request = [PKPaymentRequest new];
+
+    NSArray *items = [self itemsFromArguments:command.arguments];
+    if (!items) {
+        CDVPluginResult* result =
+            [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                              messageAsString:@"Invalid payment payload (items parsing failed)."];
+        [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+        return;
+    }
+
+    NSArray *methods = [self shippingMethodsFromArguments:command.arguments];
+
+    request.currencyCode = [self currencyCodeFromArguments:command.arguments];
+    request.countryCode = [self countryCodeFromArguments:command.arguments];
+    request.merchantIdentifier = [self merchantIdentifierFromArguments:command.arguments];
+    request.merchantCapabilities = [self merchantCapabilitiesFromArguments:command.arguments];
+    request.supportedNetworks = [self supportedNetworksFromArguments:command.arguments];
+    request.requiredBillingAddressFields = [self billingAddressRequirementFromArguments:command.arguments];
+    request.requiredShippingAddressFields = [self shippingAddressRequirementFromArguments:command.arguments];
+    request.shippingType = [self shippingTypeFromArguments:command.arguments];
+
+    if (methods) request.shippingMethods = methods;
+
+    // Start from your existing items (which should already include the final "total" line as the last item)
+    NSMutableArray *itemsMutable = [items mutableCopy];
+
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
-    if (hasRecurring) {
+    if (hasRecurring && @available(iOS 16.0, *)) {
         PKRecurringPaymentRequest *recurringReq = [self recurringPaymentRequestFromArguments:command.arguments];
         if (!recurringReq) {
             CDVPluginResult* result =
@@ -448,29 +492,36 @@
             [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
             return;
         }
-        if (@available(iOS 16.0, *)) {
-            request.recurringPaymentRequest = recurringReq;
+
+        // ✅ REQUIRED: this is what actually enables recurring payments in Apple Pay
+        request.recurringPaymentRequest = recurringReq;
+
+        // ✅ OPTIONAL: add a visible recurring line item WITHOUT breaking the “total last” convention
+        NSDictionary *rpr = [root[@"recurringPaymentRequest"] isKindOfClass:[NSDictionary class]] ? root[@"recurringPaymentRequest"] : nil;
+        NSDictionary *regularBillingDict = [rpr[@"regularBilling"] isKindOfClass:[NSDictionary class]] ? rpr[@"regularBilling"] : nil;
+
+        PKRecurringPaymentSummaryItem *regularBillingItem = [self recurringSummaryItemFromDictionary:regularBillingDict];
+        if (regularBillingItem) {
+            // Insert before last item (keep total last)
+            NSInteger insertIndex = MAX((NSInteger)itemsMutable.count - 1, 0);
+            [itemsMutable insertObject:regularBillingItem atIndex:insertIndex];
         }
-    }
-#else
-    if (hasRecurring) {
-        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                                   messageAsString:@"recurringPaymentRequest requires building with an iOS 16+ SDK."];
-        [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
-        return;
     }
 #endif
 
+    request.paymentSummaryItems = [itemsMutable copy];
+
     self.shippingMethods = methods;
-    self.summaryItems = items;
+    self.summaryItems = request.paymentSummaryItems;
 
-    NSLog(@"ApplePay request == %@", request);
-
-    PKPaymentAuthorizationViewController *authVC = [[PKPaymentAuthorizationViewController alloc] initWithPaymentRequest:request];
+    PKPaymentAuthorizationViewController *authVC =
+        [[PKPaymentAuthorizationViewController alloc] initWithPaymentRequest:request];
     authVC.delegate = self;
 
-    if (authVC == nil) {
-        CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString: @"PKPaymentAuthorizationViewController was nil."];
+    if (!authVC) {
+        CDVPluginResult* result =
+            [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                              messageAsString:@"PKPaymentAuthorizationViewController was nil."];
         [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
         return;
     }
