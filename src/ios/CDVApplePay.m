@@ -290,7 +290,7 @@
     if (s == nil || (id)s == [NSNull null] || s.length == 0) return nil;
 
     if (@available(iOS 10.0, *)) {
-        ISO8601DateFormatter *fmt = [ISO8601DateFormatter new];
+        NSISO8601DateFormatter *fmt = [NSISO8601DateFormatter new];
         NSDate *d = [fmt dateFromString:s];
         if (d) return d;
     }
@@ -384,7 +384,9 @@
     NSDictionary *rpr  = root[@"recurringPaymentRequest"];
     if (!(rpr && (id)rpr != [NSNull null])) return nil;
 
-    if (!@available(iOS 16.0, *)) {
+    if (@available(iOS 16.0, *)) {
+        // ok
+    } else {
         return nil;
     }
 
@@ -483,28 +485,34 @@
     NSMutableArray *itemsMutable = [items mutableCopy];
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
-    if (hasRecurring && @available(iOS 16.0, *)) {
-        PKRecurringPaymentRequest *recurringReq = [self recurringPaymentRequestFromArguments:command.arguments];
-        if (!recurringReq) {
+    if (hasRecurring) {
+        if (@available(iOS 16.0, *)) {
+            PKRecurringPaymentRequest *recurringReq = [self recurringPaymentRequestFromArguments:command.arguments];
+            if (!recurringReq) {
+                CDVPluginResult* result =
+                    [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                      messageAsString:@"Invalid recurringPaymentRequest payload."];
+                [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
+                return;
+            }
+
+            request.recurringPaymentRequest = recurringReq;
+
+            // OPTIONAL: insert visible recurring line item before total
+            NSDictionary *rpr = [root[@"recurringPaymentRequest"] isKindOfClass:[NSDictionary class]] ? root[@"recurringPaymentRequest"] : nil;
+            NSDictionary *regularBillingDict = [rpr[@"regularBilling"] isKindOfClass:[NSDictionary class]] ? rpr[@"regularBilling"] : nil;
+
+            PKRecurringPaymentSummaryItem *regularBillingItem = [self recurringSummaryItemFromDictionary:regularBillingDict];
+            if (regularBillingItem) {
+                NSInteger insertIndex = MAX((NSInteger)itemsMutable.count - 1, 0);
+                [itemsMutable insertObject:regularBillingItem atIndex:insertIndex];
+            }
+        } else {
             CDVPluginResult* result =
                 [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                  messageAsString:@"Invalid recurringPaymentRequest payload."];
+                                  messageAsString:@"recurringPaymentRequest requires iOS 16+."];
             [self.commandDelegate sendPluginResult:result callbackId:self.paymentCallbackId];
             return;
-        }
-
-        // ✅ REQUIRED: this is what actually enables recurring payments in Apple Pay
-        request.recurringPaymentRequest = recurringReq;
-
-        // ✅ OPTIONAL: add a visible recurring line item WITHOUT breaking the “total last” convention
-        NSDictionary *rpr = [root[@"recurringPaymentRequest"] isKindOfClass:[NSDictionary class]] ? root[@"recurringPaymentRequest"] : nil;
-        NSDictionary *regularBillingDict = [rpr[@"regularBilling"] isKindOfClass:[NSDictionary class]] ? rpr[@"regularBilling"] : nil;
-
-        PKRecurringPaymentSummaryItem *regularBillingItem = [self recurringSummaryItemFromDictionary:regularBillingDict];
-        if (regularBillingItem) {
-            // Insert before last item (keep total last)
-            NSInteger insertIndex = MAX((NSInteger)itemsMutable.count - 1, 0);
-            [itemsMutable insertObject:regularBillingItem atIndex:insertIndex];
         }
     }
 #endif
